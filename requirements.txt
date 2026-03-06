@@ -1,0 +1,16 @@
+fastapi[all]
+python-multipart
+ffmpeg-python
+demucs
+librosa
+numpy
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+python-dotenv
+sqlalchemy[asyncio]
+asyncpg
+psycopg2-binary
+razorpay
+PyJWT

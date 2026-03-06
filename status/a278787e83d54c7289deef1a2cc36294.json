@@ -1,0 +1,1 @@
+{"step": 3, "message": "Error: <HttpError 403 when requesting None returned \"Request had insufficient authentication scopes.\". Details: \"[{'message': 'Insufficient Permission', 'domain': 'global', 'reason': 'insufficientPermissions'}]\">", "progress": 100}
