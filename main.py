@@ -147,6 +147,19 @@ def _cleanup_paths(*paths: Path) -> None:
             pass
 
 
+def cleanup_files(paths: list) -> None:
+    """Best-effort cleanup for files/folders without crashing request lifecycle."""
+    for raw_path in paths:
+        try:
+            p = Path(raw_path)
+            if p.is_dir():
+                shutil.rmtree(p)
+            elif p.exists():
+                os.remove(p)
+        except Exception as e:
+            logging.warning(f"Cleanup skipped for {raw_path}: {e}")
+
+
 def _run_with_progress(cmd: list, task_id: str, step_name: str) -> subprocess.CompletedProcess:
     """Run subprocess with real-time progress tracking."""
     _write_status(task_id, {"step": 2, "message": f"{step_name}...", "progress": 0})
@@ -356,14 +369,13 @@ def _process_job(
         err_detail = traceback.format_exc()
         logging.error(f"[{task_id}] FAILED:\n{err_detail}")
         _write_status(task_id, {"step": 3, "message": f"Error: {e}", "progress": 100})
-    finally:
-        _cleanup_paths(audio, image, output)
 
 
 # ── Shared upload handler ─────────────────────────────────────────────────────
 async def _handle_upload(
     audio_file: UploadFile,
     image_file: UploadFile,
+    background_tasks: Optional[BackgroundTasks],
     title: str,
     desc: str,
     privacy: str,
@@ -392,16 +404,34 @@ async def _handle_upload(
     # Auto-promo injection for free users
     desc = inject_auto_promo(desc, plan_type)
 
-    threading.Thread(
-        target=_process_job,
-        args=(
+    if background_tasks is not None:
+        # 1) Process upload in background after response.
+        # 2) Run strict cleanup immediately after process finishes (success/failure).
+        demucs_dirs = [
+            BASE_DIR / "separated" / "htdemucs" / a_p.stem,
+            BASE_DIR / "separated" / "htdemucs_ft" / a_p.stem,
+        ]
+        cleanup_targets = [a_p, i_p, o_p, *demucs_dirs]
+
+        background_tasks.add_task(
+            _process_job,
             task_id, a_p, i_p, o_p,
             title or (audio_file.filename or "Untitled"),
             desc, privacy, token, refresh_token,
             tags, category_id, made_for_kids,
-        ),
-        daemon=True,
-    ).start()
+        )
+        background_tasks.add_task(cleanup_files, cleanup_targets)
+    else:
+        threading.Thread(
+            target=_process_job,
+            args=(
+                task_id, a_p, i_p, o_p,
+                title or (audio_file.filename or "Untitled"),
+                desc, privacy, token, refresh_token,
+                tags, category_id, made_for_kids,
+            ),
+            daemon=True,
+        ).start()
 
     return {"task_id": task_id, "job_id": task_id}
 
@@ -1141,6 +1171,7 @@ async def analyze_bpm(
 
 @app.post("/upload_and_publish")
 async def upload_and_publish(
+    background_tasks: BackgroundTasks,
     audio_file: UploadFile = File(...),
     image_file: UploadFile = File(...),
     title: str = Form(""),
@@ -1155,7 +1186,7 @@ async def upload_and_publish(
 ):
     parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
     return await _handle_upload(
-        audio_file, image_file, title, description, privacy_status,
+        audio_file, image_file, background_tasks, title, description, privacy_status,
         youtube_access_token, youtube_refresh_token,
         tags=parsed_tags, category_id=category_id,
         made_for_kids=made_for_kids.lower() == "yes",
@@ -1165,6 +1196,7 @@ async def upload_and_publish(
 
 @app.post("/upload_to_youtube")
 async def upload_to_youtube(
+    background_tasks: BackgroundTasks,
     audio_file: UploadFile = File(...),
     image_file: UploadFile = File(...),
     title: str = Form(""),
@@ -1179,7 +1211,7 @@ async def upload_to_youtube(
 ):
     parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
     return await _handle_upload(
-        audio_file, image_file, title, description, privacy_status,
+        audio_file, image_file, background_tasks, title, description, privacy_status,
         youtube_access_token, youtube_refresh_token,
         tags=parsed_tags, category_id=category_id,
         made_for_kids=made_for_kids.lower() == "yes",
@@ -1221,7 +1253,7 @@ async def batch_upload(
     for idx, audio_file in enumerate(audio_files):
         title = title_list[idx] if idx < len(title_list) else (audio_file.filename or f"Track {idx + 1}")
         result = await _handle_upload(
-            audio_file, image_file, title, description, privacy_status,
+            audio_file, image_file, None, title, description, privacy_status,
             youtube_access_token, youtube_refresh_token,
             tags=parsed_tags, category_id=category_id,
             plan_type=plan_type,
