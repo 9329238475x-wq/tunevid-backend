@@ -348,6 +348,7 @@ def _process_job(
     tags: list[str] | None = None,
     category_id: str = "10",
     made_for_kids: bool = False,
+    cleanup_on_finish: list | None = None,
 ) -> None:
     try:
         _run_ffmpeg(image, audio, output, task_id)
@@ -369,6 +370,12 @@ def _process_job(
         err_detail = traceback.format_exc()
         logging.error(f"[{task_id}] FAILED:\n{err_detail}")
         _write_status(task_id, {"step": 3, "message": f"Error: {e}", "progress": 100})
+    finally:
+        # Self-cleanup when running inside a thread (batch uploads).
+        # When running via BackgroundTasks, cleanup_on_finish is None —
+        # a separate cleanup task handles it instead.
+        if cleanup_on_finish:
+            cleanup_files(cleanup_on_finish)
 
 
 # ── Shared upload handler ─────────────────────────────────────────────────────
@@ -404,15 +411,20 @@ async def _handle_upload(
     # Auto-promo injection for free users
     desc = inject_auto_promo(desc, plan_type)
 
-    if background_tasks is not None:
-        # 1) Process upload in background after response.
-        # 2) Run strict cleanup immediately after process finishes (success/failure).
-        demucs_dirs = [
-            BASE_DIR / "separated" / "htdemucs" / a_p.stem,
-            BASE_DIR / "separated" / "htdemucs_ft" / a_p.stem,
-        ]
-        cleanup_targets = [a_p, i_p, o_p, *demucs_dirs]
+    # Common cleanup targets: input files, output video, Demucs dirs, status files
+    demucs_dirs = [
+        BASE_DIR / "separated" / "htdemucs" / a_p.stem,
+        BASE_DIR / "separated" / "htdemucs_ft" / a_p.stem,
+    ]
+    status_files = [
+        STATUS_DIR / f"{task_id}.json",
+        STATUS_DIR / f"{task_id}.cancel",
+    ]
+    all_cleanup = [a_p, i_p, o_p, *demucs_dirs, *status_files]
 
+    if background_tasks is not None:
+        # BackgroundTasks path: tasks run sequentially —
+        # process first, then cleanup fires after it finishes.
         background_tasks.add_task(
             _process_job,
             task_id, a_p, i_p, o_p,
@@ -420,8 +432,10 @@ async def _handle_upload(
             desc, privacy, token, refresh_token,
             tags, category_id, made_for_kids,
         )
-        background_tasks.add_task(cleanup_files, cleanup_targets)
+        background_tasks.add_task(cleanup_files, all_cleanup)
     else:
+        # Thread-based path (batch uploads) — thread self-cleans
+        # via cleanup_on_finish after success/failure.
         threading.Thread(
             target=_process_job,
             args=(
@@ -430,6 +444,7 @@ async def _handle_upload(
                 desc, privacy, token, refresh_token,
                 tags, category_id, made_for_kids,
             ),
+            kwargs={"cleanup_on_finish": all_cleanup},
             daemon=True,
         ).start()
 
