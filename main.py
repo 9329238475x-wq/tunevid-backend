@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -60,16 +61,146 @@ from database import init_db, close_db, get_db
 from models import User
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STORAGE & CONCURRENCY PROTECTION (1GB Hugging Face limit)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- Config ---
+STORAGE_HARD_LIMIT_MB = 900     # Reject new uploads above this
+STORAGE_SOFT_LIMIT_MB = 700     # Trigger aggressive cleanup above this
+FILE_MAX_AGE_SECONDS = 600      # Normal: delete files older than 10 min
+FILE_EMERGENCY_AGE_SECONDS = 120  # Aggressive: delete files older than 2 min
+WATCHDOG_INTERVAL_SECONDS = 60  # Check storage every 60 seconds
+MAX_CONCURRENT_JOBS = 3         # Max heavy FFmpeg/Demucs jobs at once
+
+# Semaphore to limit concurrent heavy processing
+_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+_job_semaphore_sync = threading.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+def _get_dir_size_mb(directory: Path) -> float:
+    """Get total size of a directory in MB."""
+    total = 0
+    try:
+        for f in directory.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total / (1024 * 1024)
+
+
+def _get_total_storage_mb() -> float:
+    """Calculate total storage used by all temp directories."""
+    base = Path(__file__).resolve().parent
+    dirs = ["uploads", "videos", "status", "tools", "downloads", "separated"]
+    total = 0.0
+    for d in dirs:
+        p = base / d
+        if p.exists():
+            total += _get_dir_size_mb(p)
+    return total
+
+
+def _purge_old_files(directory: Path, max_age_seconds: int) -> int:
+    """Delete files older than max_age_seconds. Returns count of deleted items."""
+    deleted = 0
+    now = time.time()
+    try:
+        for item in directory.iterdir():
+            try:
+                age = now - item.stat().st_mtime
+                if age > max_age_seconds:
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+                    deleted += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return deleted
+
+
+def _startup_cleanup() -> None:
+    """Wipe all temp directories on server boot — start fresh."""
+    base = Path(__file__).resolve().parent
+    for d in ["uploads", "videos", "status", "tools", "downloads", "separated"]:
+        p = base / d
+        if p.exists():
+            for item in p.iterdir():
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    logging.info("🧹 Startup cleanup complete — all temp files removed")
+
+
+async def _storage_watchdog() -> None:
+    """Background loop: checks storage every 60s and purges old files."""
+    base = Path(__file__).resolve().parent
+    temp_dirs = [base / d for d in ["uploads", "videos", "status", "tools", "downloads", "separated"]]
+
+    while True:
+        try:
+            await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+            usage_mb = _get_total_storage_mb()
+
+            if usage_mb > STORAGE_SOFT_LIMIT_MB:
+                # EMERGENCY: aggressive cleanup (2 min old files)
+                logging.warning(f"⚠️ Storage {usage_mb:.0f}MB > {STORAGE_SOFT_LIMIT_MB}MB — EMERGENCY cleanup!")
+                total_deleted = 0
+                for d in temp_dirs:
+                    if d.exists():
+                        total_deleted += _purge_old_files(d, FILE_EMERGENCY_AGE_SECONDS)
+                logging.info(f"🧹 Emergency purge: {total_deleted} items deleted, now {_get_total_storage_mb():.0f}MB")
+            else:
+                # Normal: cleanup files older than 10 min
+                total_deleted = 0
+                for d in temp_dirs:
+                    if d.exists():
+                        total_deleted += _purge_old_files(d, FILE_MAX_AGE_SECONDS)
+                if total_deleted > 0:
+                    logging.info(f"🧹 Routine cleanup: {total_deleted} items deleted, now {_get_total_storage_mb():.0f}MB")
+        except Exception as e:
+            logging.error(f"Watchdog error: {e}")
+
+
+def _check_storage_available() -> None:
+    """Raise 503 if storage is critically full. Call before accepting uploads."""
+    usage = _get_total_storage_mb()
+    if usage > STORAGE_HARD_LIMIT_MB:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Server storage full ({usage:.0f}MB/{STORAGE_HARD_LIMIT_MB}MB). Please try again in a few minutes.",
+        )
+
+
 # ── App Lifecycle ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: init DB. Shutdown: close connections."""
+    """Startup: cleanup + init DB + start watchdog. Shutdown: close connections."""
+    # 1) Wipe leftover temp files from previous run
+    _startup_cleanup()
+    # 2) Init database
     try:
         await init_db()
         logging.info("✅ Database initialized")
     except Exception as e:
         logging.warning(f"⚠️ Database init skipped (not connected): {e}")
+    # 3) Start storage watchdog
+    watchdog_task = asyncio.create_task(_storage_watchdog())
+    logging.info("🛡️ Storage watchdog started")
     yield
+    # Shutdown
+    watchdog_task.cancel()
     try:
         await close_db()
     except Exception:
@@ -113,6 +244,10 @@ for d in (UPLOAD_DIR, VIDEOS_DIR, STATUS_DIR, TOOLS_DIR, DOWNLOADS_DIR):
 
 # Real-time progress tracking (task_id -> progress percentage)
 progress_store = {}
+
+# Separated dir for Demucs output detection
+SEPARATED_DIR = BASE_DIR / "separated"
+SEPARATED_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=DOWNLOADS_DIR), name="static")
 
@@ -393,6 +528,7 @@ async def _handle_upload(
     made_for_kids: bool = False,
     plan_type: str = "free",
 ) -> dict:
+    _check_storage_available()
     task_id = uuid.uuid4().hex
     audio_ext = Path(audio_file.filename or "a.mp3").suffix or ".mp3"
     image_ext = Path(image_file.filename or "i.jpg").suffix or ".jpg"
@@ -475,6 +611,7 @@ async def vocal_remover(
     _abuse: None = Depends(detect_abuse),
 ):
     """Vocal Remover using Demucs (Meta). Supports 2-stem and 4-stem separation with model selection."""
+    _check_storage_available()
     if not audio_file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
@@ -535,7 +672,7 @@ async def vocal_remover(
             stem_urls[stem_name] = f"/static/{output_name}"
             download_paths.append(output_dest)
 
-        await _schedule_cleanup(background, input_path, output_dir, *download_paths, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, output_dir, *download_paths, delay_seconds=300)
         return {"task_id": task_id, "stems": stem_urls}
 
     except subprocess.CalledProcessError as e:
@@ -589,7 +726,7 @@ async def trim_audio(
             output_path = DOWNLOADS_DIR / f"{task_id}_trimmed.mp3"
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Trimming failed")
-        await _schedule_cleanup(background, input_path, output_path, delay_seconds=1200)
+        await _schedule_cleanup(background, input_path, output_path, delay_seconds=300)
         return {"download_url": f"/static/{output_path.name}"}
     except subprocess.CalledProcessError as e:
         _cleanup_paths(input_path, output_path)
@@ -636,7 +773,7 @@ async def slowed_reverb(
         subprocess.run(["ffmpeg", "-y", "-i", str(input_path), "-filter:a", filter_chain, "-b:a", "320k", str(output_path)], check=True, capture_output=True, text=True)
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Processing failed")
-        await _schedule_cleanup(background, input_path, output_path, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, output_path, delay_seconds=300)
         return {"download_url": f"/static/{output_path.name}"}
     except subprocess.CalledProcessError as e:
         _cleanup_paths(input_path, output_path)
@@ -688,7 +825,7 @@ async def convert_audio(
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Conversion failed")
         size_bytes = output_path.stat().st_size
-        await _schedule_cleanup(background, input_path, output_path, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, output_path, delay_seconds=300)
         return {"download_url": f"/static/{output_path.name}", "size_bytes": size_bytes}
     except subprocess.CalledProcessError as e:
         _cleanup_paths(input_path, output_path)
@@ -740,7 +877,7 @@ async def bass_boost(
         subprocess.run(["ffmpeg", "-y", "-i", str(input_path), "-filter:a", filter_chain, "-b:a", "320k", str(output_path)], check=True, capture_output=True, text=True)
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Processing failed")
-        await _schedule_cleanup(background, input_path, output_path, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, output_path, delay_seconds=300)
         return {"download_url": f"/static/{output_path.name}"}
     except subprocess.CalledProcessError as e:
         _cleanup_paths(input_path, output_path)
@@ -808,7 +945,7 @@ async def eight_d_audio(
         subprocess.run(["ffmpeg", "-y", "-i", str(input_path), "-filter:a", filter_chain, "-b:a", "320k", str(output_path)], check=True, capture_output=True, text=True)
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Processing failed")
-        await _schedule_cleanup(background, input_path, output_path, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, output_path, delay_seconds=300)
         return {"download_url": f"/static/{output_path.name}"}
     except subprocess.CalledProcessError as e:
         _cleanup_paths(input_path, output_path)
@@ -891,7 +1028,7 @@ async def merge_audio(
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Merge failed")
 
-        await _schedule_cleanup(background, temp_dir, output_path, delay_seconds=1800)
+        await _schedule_cleanup(background, temp_dir, output_path, delay_seconds=300)
         return {"download_url": f"/static/{output_path.name}"}
 
     except subprocess.CalledProcessError as e:
@@ -945,7 +1082,7 @@ async def compress_audio(
             raise HTTPException(status_code=500, detail="Compression failed")
         original_size = input_path.stat().st_size
         new_size = final_path.stat().st_size
-        await _schedule_cleanup(background, input_path, final_path, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, final_path, delay_seconds=300)
         return {"download_url": f"/static/{final_path.name}", "original_size": original_size, "new_size": new_size, "compression_ratio": 1 - (new_size / original_size)}
     except subprocess.CalledProcessError as e:
         _cleanup_paths(input_path, output_path)
@@ -998,7 +1135,7 @@ async def denoise_audio(
         subprocess.run(["ffmpeg", "-y", "-i", str(input_path), "-af", filter_chain, "-b:a", "320k", str(output_path)], check=True, capture_output=True, text=True)
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Denoising failed")
-        await _schedule_cleanup(background, input_path, output_path, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, output_path, delay_seconds=300)
         return {"download_url": f"/static/{output_path.name}"}
     except subprocess.CalledProcessError as e:
         _cleanup_paths(input_path, output_path)
@@ -1058,7 +1195,7 @@ async def remove_silence(
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Silence removal failed")
         new_duration = _get_audio_duration(output_path)
-        await _schedule_cleanup(background, input_path, output_path, delay_seconds=1800)
+        await _schedule_cleanup(background, input_path, output_path, delay_seconds=300)
         return {
             "download_url": f"/static/{output_path.name}",
             "old_duration": old_duration,
@@ -1303,7 +1440,39 @@ async def cancel_job(task_id: str):
 # ── Health Check ──────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": "4.0.0", "service": "TuneVid API"}
+    usage_mb = _get_total_storage_mb()
+    return {
+        "status": "ok",
+        "version": "4.0.0",
+        "service": "TuneVid API",
+        "storage_used_mb": round(usage_mb, 1),
+        "storage_limit_mb": STORAGE_HARD_LIMIT_MB,
+        "storage_healthy": usage_mb < STORAGE_SOFT_LIMIT_MB,
+    }
+
+
+@app.get("/storage")
+async def storage_status():
+    """Live storage monitoring endpoint."""
+    base = Path(__file__).resolve().parent
+    breakdown = {}
+    for d in ["uploads", "videos", "status", "tools", "downloads", "separated"]:
+        p = base / d
+        if p.exists():
+            size = _get_dir_size_mb(p)
+            file_count = sum(1 for _ in p.rglob("*") if _.is_file())
+            breakdown[d] = {"size_mb": round(size, 2), "files": file_count}
+        else:
+            breakdown[d] = {"size_mb": 0, "files": 0}
+
+    total = sum(v["size_mb"] for v in breakdown.values())
+    return {
+        "total_used_mb": round(total, 1),
+        "hard_limit_mb": STORAGE_HARD_LIMIT_MB,
+        "soft_limit_mb": STORAGE_SOFT_LIMIT_MB,
+        "status": "critical" if total > STORAGE_HARD_LIMIT_MB else ("warning" if total > STORAGE_SOFT_LIMIT_MB else "healthy"),
+        "breakdown": breakdown,
+    }
 
 
 if __name__ == "__main__":
