@@ -375,9 +375,9 @@ def _get_image_size(image: Path) -> tuple:
 
 
 def _run_ffmpeg(image: Path, audio: Path, output: Path, task_id: str) -> None:
-    _write_status(task_id, {"step": 1, "message": "Generating video…", "progress": 10})
-    width, height = _get_image_size(image)
+    _write_status(task_id, {"step": 1, "message": "Preparing video…", "progress": 10})
 
+    # Get audio duration for progress tracking
     duration = 1.0
     try:
         p = subprocess.run(
@@ -389,20 +389,35 @@ def _run_ffmpeg(image: Path, audio: Path, output: Path, task_id: str) -> None:
     except Exception:
         pass
 
+    _write_status(task_id, {"step": 1, "message": "Generating 1080p HD video…", "progress": 12})
+
+    # 1080p HD output: scale image to 1920x1080 with padding to maintain aspect ratio
     cmd = [
         "ffmpeg", "-progress", "pipe:1", "-nostats", "-y",
         "-loop", "1",
         "-i", str(image),
         "-i", str(audio),
-        "-vf", f"scale={width}:{height},format=yuv420p",
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
-        "-crf", "28", "-r", "1",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",
+        "-c:v", "libx264", "-preset", "medium", "-tune", "stillimage",
+        "-crf", "18", "-r", "1",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-shortest", "-movflags", "+faststart",
         str(output),
     ]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    logging.info(f"[{task_id}] FFmpeg command: {' '.join(cmd)}")
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    # Read stderr in background thread to prevent deadlock
+    stderr_lines = []
+    def read_stderr():
+        for line in iter(proc.stderr.readline, ''):
+            if line:
+                stderr_lines.append(line)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stderr_thread.start()
+
     if proc.stdout:
         for line in proc.stdout:
             if "out_time_ms=" in line:
@@ -411,12 +426,18 @@ def _run_ffmpeg(image: Path, audio: Path, output: Path, task_id: str) -> None:
                     pc = min(int((ms / (duration * 1_000_000)) * 100), 99)
                     _write_status(task_id, {
                         "step": 1,
-                        "message": f"Generating video… {pc}%",
+                        "message": f"Generating 1080p HD video… {pc}%",
                         "progress": 10 + int(pc * 0.6),
                     })
                 except Exception:
                     pass
     proc.wait()
+    stderr_thread.join(timeout=5)
+
+    if proc.returncode != 0:
+        err = ''.join(stderr_lines[-10:]) if stderr_lines else 'Unknown error'
+        logging.error(f"[{task_id}] FFmpeg failed: {err}")
+        raise RuntimeError(f"FFmpeg failed: {err}")
 
 
 # ── YouTube upload ────────────────────────────────────────────────────────────
@@ -513,7 +534,95 @@ def _process_job(
             cleanup_files(cleanup_on_finish)
 
 
-# ── Shared upload handler ─────────────────────────────────────────────────────
+# ── Pre-upload endpoint (files upload on selection) ───────────────────────────
+@app.post("/api/upload-file")
+async def upload_single_file(
+    file: UploadFile = File(...),
+    file_type: str = Form("audio"),  # "audio" or "image"
+):
+    """Upload a single file immediately when user selects it. Returns file_id."""
+    _check_storage_available()
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    file_id = uuid.uuid4().hex
+    ext = Path(file.filename).suffix or (".mp3" if file_type == "audio" else ".jpg")
+    save_path = UPLOAD_DIR / f"{file_id}_{file_type}{ext}"
+
+    with save_path.open("wb") as f:
+        f.write(await file.read())
+
+    file_size = save_path.stat().st_size
+    logging.info(f"Pre-uploaded {file_type}: {file.filename} -> {save_path.name} ({file_size} bytes)")
+
+    return {
+        "file_id": file_id,
+        "file_type": file_type,
+        "filename": file.filename,
+        "size": file_size,
+        "path": str(save_path),
+    }
+
+
+# ── Publish endpoint (uses pre-uploaded files, no file upload needed) ─────────
+@app.post("/api/publish")
+async def publish_to_youtube(
+    background_tasks: BackgroundTasks,
+    audio_file_id: str = Form(...),
+    image_file_id: str = Form(...),
+    title: str = Form(""),
+    description: str = Form(""),
+    privacy_status: str = Form("private"),
+    made_for_kids: str = Form("no"),
+    tags: str = Form(""),
+    category_id: str = Form("10"),
+    youtube_access_token: str = Form(...),
+    youtube_refresh_token: str = Form(""),
+    plan_type: str = Form("free"),
+):
+    """Publish using pre-uploaded files. FFmpeg combines audio+image into 1080p HD video, then uploads to YouTube."""
+    # Find pre-uploaded files
+    audio_path = None
+    image_path = None
+    for f in UPLOAD_DIR.iterdir():
+        if f.name.startswith(f"{audio_file_id}_audio"):
+            audio_path = f
+        elif f.name.startswith(f"{image_file_id}_image"):
+            image_path = f
+
+    if not audio_path or not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file not found. Please re-upload.")
+    if not image_path or not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image file not found. Please re-upload.")
+
+    parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
+    desc = inject_auto_promo(description, plan_type)
+
+    task_id = uuid.uuid4().hex
+    o_p = VIDEOS_DIR / f"{task_id}_o.mp4"
+
+    _write_status(task_id, {"step": 1, "message": "Starting video generation…", "progress": 5})
+
+    # Cleanup targets
+    status_files = [
+        STATUS_DIR / f"{task_id}.json",
+        STATUS_DIR / f"{task_id}.cancel",
+    ]
+    all_cleanup = [audio_path, image_path, o_p, *status_files]
+
+    background_tasks.add_task(
+        _process_job,
+        task_id, audio_path, image_path, o_p,
+        title or "Untitled",
+        desc, privacy_status, youtube_access_token, youtube_refresh_token,
+        parsed_tags, category_id, made_for_kids.lower() == "yes",
+    )
+    background_tasks.add_task(cleanup_files, all_cleanup)
+
+    return {"task_id": task_id, "job_id": task_id}
+
+
+# ── Shared upload handler (legacy, kept for backward compat) ──────────────────
 async def _handle_upload(
     audio_file: UploadFile,
     image_file: UploadFile,
@@ -537,17 +646,19 @@ async def _handle_upload(
     i_p = UPLOAD_DIR / f"{task_id}_i{image_ext}"
     o_p = VIDEOS_DIR / f"{task_id}_o.mp4"
 
-    _write_status(task_id, {"step": 1, "message": "Files received. Starting…", "progress": 5})
+    _write_status(task_id, {"step": 1, "message": "Saving files…", "progress": 5})
 
     with a_p.open("wb") as f:
         f.write(await audio_file.read())
     with i_p.open("wb") as f:
         f.write(await image_file.read())
 
+    _write_status(task_id, {"step": 1, "message": "Files saved. Starting video generation…", "progress": 8})
+
     # Auto-promo injection for free users
     desc = inject_auto_promo(desc, plan_type)
 
-    # Common cleanup targets: input files, output video, Demucs dirs, status files
+    # Common cleanup targets
     demucs_dirs = [
         BASE_DIR / "separated" / "htdemucs" / a_p.stem,
         BASE_DIR / "separated" / "htdemucs_ft" / a_p.stem,
@@ -559,8 +670,6 @@ async def _handle_upload(
     all_cleanup = [a_p, i_p, o_p, *demucs_dirs, *status_files]
 
     if background_tasks is not None:
-        # BackgroundTasks path: tasks run sequentially —
-        # process first, then cleanup fires after it finishes.
         background_tasks.add_task(
             _process_job,
             task_id, a_p, i_p, o_p,
@@ -570,8 +679,6 @@ async def _handle_upload(
         )
         background_tasks.add_task(cleanup_files, all_cleanup)
     else:
-        # Thread-based path (batch uploads) — thread self-cleans
-        # via cleanup_on_finish after success/failure.
         threading.Thread(
             target=_process_job,
             args=(
